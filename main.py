@@ -39,6 +39,8 @@ import time
 from collections import deque
 import pyrealsense2 as rs
 from typing import Optional
+from multiprocessing import Pool, cpu_count
+import os
 
 # ───── Camera / marker settings ───────────────────────────
 # Use Intel RealSense camera
@@ -63,6 +65,9 @@ FAST_MODE = True  # If True, reduce attempts for speed; toggle with 'f'
 # Slight polygon expansion when rasterizing to the grid (mm) – helps fit when
 # edges are a bit under-segmented; kept small to avoid overfitting
 ALLOWED_MARGIN_MM = 1.0  # Minimal margin for tightest packing
+# Multi-processing settings
+NUM_WORKERS = 8  # Number of parallel workers for packing (0 = auto-detect CPU count)
+ENABLE_MULTIPROCESSING = True  # Enable parallel packing optimization
 
 # ───── Optional GPU acceleration (OpenCV CUDA) ────────────
 ENABLE_CUDA = False
@@ -4869,6 +4874,136 @@ def create_distribution_cache_key(selected_objects: list, remaining_pieces: list
     except Exception:
         return None
 
+def _packing_worker_attempt(args):
+    """Worker function for parallel packing attempts.
+
+    This function is called by multiprocessing workers to execute a single
+    packing attempt with a specific strategy.
+
+    Args:
+        args: Tuple of (attempt_num, sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
+                       adaptive_cell_mm, cached_grid, ordered_pieces, fittable_pieces_len)
+
+    Returns:
+        Tuple of (count, placed_area, compactness, used_list) or None if failed
+    """
+    try:
+        (attempt, sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
+         adaptive_cell_mm, cached_grid, ordered_pieces, fittable_pieces_len) = args
+
+        # Determine which packer to use based on strategy
+        strategy_id = attempt % 15
+        use_greedy_ffd = strategy_id in [8, 11, 12]
+        use_greedy_blf = strategy_id in [9, 10, 13, 14]
+
+        if allowed_polygon_mm is not None and len(allowed_polygon_mm) >= 3:
+            if use_greedy_blf:
+                packer = PolygonGridPackerBLF(sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
+                                            cell_mm=adaptive_cell_mm, seed=attempt, allowed_grid=cached_grid)
+            else:
+                packer = PolygonGridPacker(sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
+                                           cell_mm=adaptive_cell_mm, seed=attempt, allowed_grid=cached_grid)
+        elif use_greedy_ffd:
+            packer = MaxRectsGreedy(sheet_width_mm, sheet_height_mm, allowed_polygon_mm)
+        else:
+            packer = MaxRects(sheet_width_mm, sheet_height_mm, allowed_polygon_mm)
+
+        placed_area = 0.0
+        placed_ids = set()
+
+        # First pass: try to place all pieces in order
+        for piece in ordered_pieces:
+            w, h, s = piece[:3]
+            piece_id = piece[3] if len(piece) > 3 else -1
+            shape_name = piece[4] if len(piece) > 4 else None
+            piece_area = (math.pi * (w/2.0) * (h/2.0)) if s == 'circle' else (w * h)
+            if packer.insert(w, h, s, piece_id=piece_id, shape_name=shape_name):
+                placed_area += piece_area
+                placed_ids.add(piece_id)
+            if len(packer.used) >= fittable_pieces_len:
+                break
+
+        # Gap filling: single pass with smart sorting (reduced for speed)
+        max_gap_filling_passes = 2
+        for gap_pass in range(max_gap_filling_passes):
+            unplaced = [p for p in ordered_pieces if (p[3] if len(p) > 3 else -1) not in placed_ids]
+            if not unplaced or len(packer.used) >= fittable_pieces_len:
+                break
+
+            pieces_placed_this_pass = 0
+
+            # Simplified sorting
+            if gap_pass == 0:
+                unplaced_sorted = sorted(unplaced, key=lambda p: p[0] * p[1])
+            else:
+                circles = [p for p in unplaced if p[2] == 'circle']
+                rects = [p for p in unplaced if p[2] != 'circle']
+                unplaced_sorted = sorted(circles, key=lambda p: p[0]) + sorted(rects, key=lambda p: p[0] * p[1])
+
+            for piece in unplaced_sorted:
+                w, h, s = piece[:3]
+                piece_id = piece[3] if len(piece) > 3 else -1
+                shape_name = piece[4] if len(piece) > 4 else None
+                if piece_id in placed_ids:
+                    continue
+                piece_area = (math.pi * (w/2.0) * (h/2.0)) if s == 'circle' else (w * h)
+                if packer.insert(w, h, s, piece_id=piece_id, shape_name=shape_name):
+                    placed_area += piece_area
+                    placed_ids.add(piece_id)
+                    pieces_placed_this_pass += 1
+
+            if pieces_placed_this_pass == 0:
+                break
+
+        # Post compaction for grid packer
+        if isinstance(packer, PolygonGridPacker):
+            try:
+                packer.shrink_envelope(rounds=1)
+            except Exception:
+                pass
+            # Defensive: remove accidental duplicates/overlaps
+            filtered = []
+            occ = np.zeros_like(packer.allowed, dtype=np.uint8)
+            for u in packer.used:
+                ux, uy, uw, uh, urot, ushape = u[:6]
+                gx = int(round(ux / packer.cell_mm))
+                gy = int(round(uy / packer.cell_mm))
+                gw = int(max(1, math.ceil(uw / packer.cell_mm)))
+                gh = int(max(1, math.ceil(uh / packer.cell_mm)))
+                if ushape == 'circle':
+                    size = max(2, gw)
+                    r = size // 2
+                    fp = np.zeros((size, size), dtype=np.uint8)
+                    cv2.circle(fp, (r, r), r, 1, -1)
+                else:
+                    fp = np.ones((gh, gw), dtype=np.uint8)
+                gx = max(0, min(gx, occ.shape[1] - fp.shape[1]))
+                gy = max(0, min(gy, occ.shape[0] - fp.shape[0]))
+                region = occ[gy:gy+fp.shape[0], gx:gx+fp.shape[1]]
+                if np.any(region[fp == 1] == 1):
+                    continue
+                region[fp == 1] = 1
+                filtered.append(u)
+            packer.used = filtered
+
+        count = len(packer.used)
+
+        # Calculate compactness metric
+        compactness = float('inf')
+        if packer.used and placed_area > 0:
+            min_x = min(u[0] for u in packer.used)
+            max_x = max(u[0] + u[2] for u in packer.used)
+            min_y = min(u[1] for u in packer.used)
+            max_y = max(u[1] + u[3] for u in packer.used)
+            bounding_area = (max_x - min_x) * (max_y - min_y)
+            compactness = bounding_area / placed_area if placed_area > 0 else float('inf')
+
+        return (count, placed_area, compactness, packer.used.copy())
+
+    except Exception as e:
+        # Return None for failed attempts
+        return None
+
 def compute_best_packing_for_object(obj: dict, pieces: list[tuple]) -> list:
     """Enhanced multi-start packing algorithm with optimized sorting strategies.
     Respects real segmented polygon when present.
@@ -5188,147 +5323,198 @@ def compute_best_packing_for_object(obj: dict, pieces: list[tuple]) -> list:
             # Strategy 14: Longest side first - good for corner/edge filling
             return longest_side_sort(fittable_pieces)
     
-    for attempt in range(attempts):
-        # Determine which greedy strategy to use
-        strategy_id = attempt % 15
-        use_greedy_ffd = strategy_id in [8, 11, 12]  # BFD, Hybrid Greedy, FFDH strategies
-        use_greedy_blf = strategy_id in [9, 10, 13, 14]  # Various BLF-friendly strategies
-        
-        if allowed_polygon_mm is not None and len(allowed_polygon_mm) >= 3:
-            if use_greedy_blf:
-                packer = PolygonGridPackerBLF(sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
-                                            cell_mm=adaptive_cell_mm, seed=attempt, allowed_grid=cached_grid)
-            else:
-                packer = PolygonGridPacker(sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
-                                           cell_mm=adaptive_cell_mm, seed=attempt, allowed_grid=cached_grid)
-        elif use_greedy_ffd:
-            packer = MaxRectsGreedy(sheet_width_mm, sheet_height_mm, allowed_polygon_mm)
-        else:
-            packer = MaxRects(sheet_width_mm, sheet_height_mm, allowed_polygon_mm)
+    # Parallel packing: prepare arguments for all attempts
+    use_multiprocessing = ENABLE_MULTIPROCESSING and attempts > 1
 
-        # Apply enhanced sorting strategy
-        ordered_pieces = get_sorting_strategy(attempt, piece_analysis)
+    if use_multiprocessing:
+        # Determine number of workers
+        num_workers = NUM_WORKERS if NUM_WORKERS > 0 else cpu_count()
+        num_workers = min(num_workers, attempts)  # Don't use more workers than attempts
 
-        placed_area = 0.0
-        placed_ids = set()
-        
-        # First pass: try to place all pieces in order
-        for piece in ordered_pieces:
-            w, h, s = piece[:3]
-            piece_id = piece[3] if len(piece) > 3 else -1
-            shape_name = piece[4] if len(piece) > 4 else None
-            piece_area = (math.pi * (w/2.0) * (h/2.0)) if s == 'circle' else (w * h)
-            if packer.insert(w, h, s, piece_id=piece_id, shape_name=shape_name):
-                placed_area += piece_area
-                placed_ids.add(piece_id)
-            # Early exit: if all pieces placed, no need to continue
-            if len(packer.used) >= len(ordered_pieces):
-                break
-        
-        # Gap filling: single pass with smart sorting (reduced for speed)
-        max_gap_filling_passes = 2  # Reduced from 5 for speed
-        for gap_pass in range(max_gap_filling_passes):
-            unplaced = [p for p in ordered_pieces if (p[3] if len(p) > 3 else -1) not in placed_ids]
-            if not unplaced or len(packer.used) >= len(ordered_pieces):
-                break  # All pieces placed or no unplaced pieces
-            
-            pieces_placed_this_pass = 0
-            
-            # Simplified sorting: smallest first, then by aspect ratio
-            if gap_pass == 0:
-                unplaced_sorted = sorted(unplaced, key=lambda p: p[0] * p[1])
+        print(f"[INFO] Using {num_workers} parallel workers for {attempts} packing attempts")
+
+        # Prepare arguments for each attempt
+        worker_args = []
+        for attempt in range(attempts):
+            ordered_pieces = get_sorting_strategy(attempt, piece_analysis)
+            worker_args.append((
+                attempt,
+                sheet_width_mm,
+                sheet_height_mm,
+                allowed_polygon_mm,
+                adaptive_cell_mm,
+                cached_grid,
+                ordered_pieces,
+                len(fittable_pieces)
+            ))
+
+        # Execute packing attempts in parallel
+        try:
+            with Pool(processes=num_workers) as pool:
+                results = pool.map(_packing_worker_attempt, worker_args)
+
+            # Find best result from all attempts
+            for attempt, result in enumerate(results):
+                if result is None:
+                    continue
+
+                count, placed_area, compactness, used_list = result
+
+                # Enhanced selection criteria: prioritize count, then area, then compactness
+                is_better = (count > best_count or
+                            (count == best_count and placed_area > best_area) or
+                            (count == best_count and placed_area == best_area and compactness < best_compactness))
+
+                if is_better:
+                    best_count = count
+                    best_area = placed_area
+                    best_compactness = compactness
+                    best_used = used_list
+
+                    # Check for perfect packing
+                    if count == len(fittable_pieces):
+                        print(f"[INFO] All pieces placed by worker {attempt+1}")
+                        break
+
+            if best_count > 0:
+                print(f"[INFO] Best result: {best_count}/{len(fittable_pieces)} pieces placed")
+
+        except Exception as e:
+            print(f"[WARN] Parallel packing failed ({e}), falling back to sequential")
+            use_multiprocessing = False  # Fallback to sequential for this call
+
+    # Sequential packing (fallback or when multiprocessing is disabled)
+    if not use_multiprocessing:
+        for attempt in range(attempts):
+            # Determine which greedy strategy to use
+            strategy_id = attempt % 15
+            use_greedy_ffd = strategy_id in [8, 11, 12]
+            use_greedy_blf = strategy_id in [9, 10, 13, 14]
+
+            if allowed_polygon_mm is not None and len(allowed_polygon_mm) >= 3:
+                if use_greedy_blf:
+                    packer = PolygonGridPackerBLF(sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
+                                                cell_mm=adaptive_cell_mm, seed=attempt, allowed_grid=cached_grid)
+                else:
+                    packer = PolygonGridPacker(sheet_width_mm, sheet_height_mm, allowed_polygon_mm,
+                                               cell_mm=adaptive_cell_mm, seed=attempt, allowed_grid=cached_grid)
+            elif use_greedy_ffd:
+                packer = MaxRectsGreedy(sheet_width_mm, sheet_height_mm, allowed_polygon_mm)
             else:
-                # Mix: circles first then small rects
-                circles = [p for p in unplaced if p[2] == 'circle']
-                rects = [p for p in unplaced if p[2] != 'circle']
-                unplaced_sorted = sorted(circles, key=lambda p: p[0]) + sorted(rects, key=lambda p: p[0] * p[1])
-            
-            for piece in unplaced_sorted:
+                packer = MaxRects(sheet_width_mm, sheet_height_mm, allowed_polygon_mm)
+
+            # Apply enhanced sorting strategy
+            ordered_pieces = get_sorting_strategy(attempt, piece_analysis)
+
+            placed_area = 0.0
+            placed_ids = set()
+
+            # First pass: try to place all pieces in order
+            for piece in ordered_pieces:
                 w, h, s = piece[:3]
                 piece_id = piece[3] if len(piece) > 3 else -1
                 shape_name = piece[4] if len(piece) > 4 else None
-                if piece_id in placed_ids:
-                    continue
                 piece_area = (math.pi * (w/2.0) * (h/2.0)) if s == 'circle' else (w * h)
                 if packer.insert(w, h, s, piece_id=piece_id, shape_name=shape_name):
                     placed_area += piece_area
                     placed_ids.add(piece_id)
-                    pieces_placed_this_pass += 1
-            
-            # If no pieces were placed in this pass, stop trying
-            if pieces_placed_this_pass == 0:
+                if len(packer.used) >= len(ordered_pieces):
+                    break
+
+            # Gap filling
+            max_gap_filling_passes = 2
+            for gap_pass in range(max_gap_filling_passes):
+                unplaced = [p for p in ordered_pieces if (p[3] if len(p) > 3 else -1) not in placed_ids]
+                if not unplaced or len(packer.used) >= len(ordered_pieces):
+                    break
+
+                pieces_placed_this_pass = 0
+
+                if gap_pass == 0:
+                    unplaced_sorted = sorted(unplaced, key=lambda p: p[0] * p[1])
+                else:
+                    circles = [p for p in unplaced if p[2] == 'circle']
+                    rects = [p for p in unplaced if p[2] != 'circle']
+                    unplaced_sorted = sorted(circles, key=lambda p: p[0]) + sorted(rects, key=lambda p: p[0] * p[1])
+
+                for piece in unplaced_sorted:
+                    w, h, s = piece[:3]
+                    piece_id = piece[3] if len(piece) > 3 else -1
+                    shape_name = piece[4] if len(piece) > 4 else None
+                    if piece_id in placed_ids:
+                        continue
+                    piece_area = (math.pi * (w/2.0) * (h/2.0)) if s == 'circle' else (w * h)
+                    if packer.insert(w, h, s, piece_id=piece_id, shape_name=shape_name):
+                        placed_area += piece_area
+                        placed_ids.add(piece_id)
+                        pieces_placed_this_pass += 1
+
+                if pieces_placed_this_pass == 0:
+                    break
+
+            # Post compaction
+            if isinstance(packer, PolygonGridPacker):
+                try:
+                    packer.shrink_envelope(rounds=1)
+                except Exception:
+                    pass
+                filtered = []
+                occ = np.zeros_like(packer.allowed, dtype=np.uint8)
+                for u in packer.used:
+                    ux, uy, uw, uh, urot, ushape = u[:6]
+                    gx = int(round(ux / packer.cell_mm))
+                    gy = int(round(uy / packer.cell_mm))
+                    gw = int(max(1, math.ceil(uw / packer.cell_mm)))
+                    gh = int(max(1, math.ceil(uh / packer.cell_mm)))
+                    if ushape == 'circle':
+                        size = max(2, gw)
+                        r = size // 2
+                        fp = np.zeros((size, size), dtype=np.uint8)
+                        cv2.circle(fp, (r, r), r, 1, -1)
+                    else:
+                        fp = np.ones((gh, gw), dtype=np.uint8)
+                    gx = max(0, min(gx, occ.shape[1] - fp.shape[1]))
+                    gy = max(0, min(gy, occ.shape[0] - fp.shape[0]))
+                    region = occ[gy:gy+fp.shape[0], gx:gx+fp.shape[1]]
+                    if np.any(region[fp == 1] == 1):
+                        continue
+                    region[fp == 1] = 1
+                    filtered.append(u)
+                packer.used = filtered
+
+            count = len(packer.used)
+
+            compactness = float('inf')
+            if packer.used and placed_area > 0:
+                min_x = min(u[0] for u in packer.used)
+                max_x = max(u[0] + u[2] for u in packer.used)
+                min_y = min(u[1] for u in packer.used)
+                max_y = max(u[1] + u[3] for u in packer.used)
+                bounding_area = (max_x - min_x) * (max_y - min_y)
+                compactness = bounding_area / placed_area if placed_area > 0 else float('inf')
+
+            is_better = (count > best_count or
+                        (count == best_count and placed_area > best_area) or
+                        (count == best_count and placed_area == best_area and compactness < best_compactness))
+
+            if is_better:
+                best_count = count
+                best_area = placed_area
+                best_compactness = compactness
+                best_used = packer.used.copy()
+
+            # Early termination
+            if count == len(fittable_pieces):
+                print(f"[INFO] All pieces placed at attempt {attempt+1}/{attempts}")
                 break
 
-        # Post compaction for grid packer and final de-overlap check
-        if isinstance(packer, PolygonGridPacker):
-            try:
-                packer.shrink_envelope(rounds=1)
-            except Exception:
-                pass
-            # Defensive: remove accidental duplicates/overlaps caused by grid rounding
-            filtered = []
-            occ = np.zeros_like(packer.allowed, dtype=np.uint8)
-            for u in packer.used:
-                ux, uy, uw, uh, urot, ushape = u[:6]
-                gx = int(round(ux / packer.cell_mm))
-                gy = int(round(uy / packer.cell_mm))
-                gw = int(max(1, math.ceil(uw / packer.cell_mm)))
-                gh = int(max(1, math.ceil(uh / packer.cell_mm)))
-                if ushape == 'circle':
-                    size = max(2, gw)
-                    r = size // 2
-                    fp = np.zeros((size, size), dtype=np.uint8)
-                    cv2.circle(fp, (r, r), r, 1, -1)
-                else:
-                    fp = np.ones((gh, gw), dtype=np.uint8)
-                # Bounds clamp
-                gx = max(0, min(gx, occ.shape[1] - fp.shape[1]))
-                gy = max(0, min(gy, occ.shape[0] - fp.shape[0]))
-                region = occ[gy:gy+fp.shape[0], gx:gx+fp.shape[1]]
-                if np.any(region[fp == 1] == 1):
-                    continue
-                region[fp == 1] = 1
-                filtered.append(u)
-            packer.used = filtered
+            if count >= len(fittable_pieces) * 0.95 and attempt >= 5:
+                print(f"[INFO] Near-optimal at attempt {attempt+1}: {count}/{len(fittable_pieces)} pieces")
+                break
 
-        count = len(packer.used)
-        
-        # Calculate compactness metric (bounding box area / placed area)
-        compactness = float('inf')
-        if packer.used and placed_area > 0:
-            min_x = min(u[0] for u in packer.used)
-            max_x = max(u[0] + u[2] for u in packer.used)
-            min_y = min(u[1] for u in packer.used)
-            max_y = max(u[1] + u[3] for u in packer.used)
-            bounding_area = (max_x - min_x) * (max_y - min_y)
-            compactness = bounding_area / placed_area if placed_area > 0 else float('inf')
-        
-        # Enhanced selection criteria: prioritize count, then area, then compactness
-        is_better = (count > best_count or 
-                    (count == best_count and placed_area > best_area) or
-                    (count == best_count and placed_area == best_area and compactness < best_compactness))
-        
-        if is_better:
-            best_count = count
-            best_area = placed_area
-            best_compactness = compactness
-            best_used = packer.used.copy()
-            
-        # Enhanced early termination - more aggressive for speed
-        # 1. Perfect packing: all pieces placed
-        if count == len(fittable_pieces):
-            print(f"[INFO] All pieces placed at attempt {attempt+1}/{attempts}")
-            break
-        
-        # 2. Good enough: 95% placed after 5 attempts
-        if count >= len(fittable_pieces) * 0.95 and attempt >= 5:
-            print(f"[INFO] Near-optimal at attempt {attempt+1}: {count}/{len(fittable_pieces)} pieces")
-            break
-        
-        # 3. Stagnation: stop if 90% placed after 10 attempts
-        if attempt >= 10 and best_count >= len(fittable_pieces) * 0.9:
-            print(f"[INFO] Stopping at attempt {attempt+1}: {best_count}/{len(fittable_pieces)} pieces")
-            break
+            if attempt >= 10 and best_count >= len(fittable_pieces) * 0.9:
+                print(f"[INFO] Stopping at attempt {attempt+1}: {best_count}/{len(fittable_pieces)} pieces")
+                break
 
     # Use H4NP result directly if available (no need for multi-start comparison)
     if h4np_backup is not None:
@@ -7376,4 +7562,17 @@ def main():
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
+    # Set multiprocessing start method for compatibility across platforms
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
+    # Display CPU info
+    cpu_count_info = cpu_count()
+    worker_count = NUM_WORKERS if NUM_WORKERS > 0 else cpu_count_info
+    print(f"[INFO] System has {cpu_count_info} CPU cores")
+    print(f"[INFO] Multiprocessing: {'ENABLED' if ENABLE_MULTIPROCESSING else 'DISABLED'} with {worker_count} workers")
+
     main()
