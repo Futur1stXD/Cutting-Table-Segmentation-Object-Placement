@@ -41,6 +41,20 @@ import pyrealsense2 as rs
 from typing import Optional
 from multiprocessing import Pool, cpu_count
 import os
+from functools import lru_cache
+
+# Try to import Numba for JIT compilation (optional speedup)
+try:
+    from numba import jit
+    NUMBA_AVAILABLE = True
+    print('[INFO] Numba JIT compiler available - enabling accelerated math operations')
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Create dummy decorator if Numba not available
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 # ───── Camera / marker settings ───────────────────────────
 # Use Intel RealSense camera
@@ -52,6 +66,7 @@ SIZE_TOLERANCE = 0.15  # Size tolerance for detection
 STABILIZATION_BUFFER_SIZE = 3  # Reduced for better responsiveness
 RECALCULATION_DELAY = 5       # Reduced for better responsiveness
 PACKING_ATTEMPTS = 25         # Maximum attempts for densest packing (reduced for speed)
+PARALLEL_PACKING_ATTEMPTS = 16  # Attempts when using multiprocessing (fewer needed due to parallelism)
 PACKING_CELL_MM = 1.0         # Default grid resolution in mm (will be adaptive)
 MIN_PACKING_CELL_MM = 0.15    # Ultra-fine precision for maximum space utilization
 MAX_PACKING_CELL_MM = 1.0     # Tighter maximum for better accuracy
@@ -3658,6 +3673,41 @@ def calculate_adaptive_cell_size(pieces: list, sheet_width_mm: float, sheet_heig
     # Round to 2 decimal places for consistency
     return round(adaptive_cell, 2)
 
+# ───── Cached helper functions for performance ──────────────
+def calculate_piece_area_fast(w, h, is_circle):
+    """Fast area calculation with optional JIT compilation."""
+    if is_circle:
+        return math.pi * (w / 2.0) * (h / 2.0)
+    else:
+        return w * h
+
+def calculate_piece_perimeter_fast(w, h, is_circle):
+    """Fast perimeter calculation with optional JIT compilation."""
+    if is_circle:
+        return math.pi * w
+    else:
+        return 2.0 * (w + h)
+
+# Apply JIT if available
+if NUMBA_AVAILABLE:
+    try:
+        calculate_piece_area_fast = jit(nopython=True, cache=True)(calculate_piece_area_fast)
+        calculate_piece_perimeter_fast = jit(nopython=True, cache=True)(calculate_piece_perimeter_fast)
+    except Exception:
+        pass  # If JIT fails, use regular Python
+
+@lru_cache(maxsize=2048)
+def get_piece_area(w, h, shape_type):
+    """Cached area calculation for pieces."""
+    is_circle = (shape_type == 'circle')
+    return calculate_piece_area_fast(w, h, is_circle)
+
+@lru_cache(maxsize=2048)
+def get_piece_perimeter(w, h, shape_type):
+    """Cached perimeter calculation for pieces."""
+    is_circle = (shape_type == 'circle')
+    return calculate_piece_perimeter_fast(w, h, is_circle)
+
 # ───── Filter for oversized pieces ──────────────────────────
 def split_cuts_to_fit(sheet_w, sheet_h, lst):
     ok, big = [], []
@@ -5211,9 +5261,16 @@ def compute_best_packing_for_object(obj: dict, pieces: list[tuple]) -> list:
             except Exception:
                 pass
 
-    # Adaptive attempt count - reduced for speed
-    base_attempts = max(1, PACKING_ATTEMPTS // (3 if FAST_MODE else 1))
-    
+    # Adaptive attempt count - use fewer attempts when multiprocessing (parallel = more coverage)
+    will_use_multiprocessing = ENABLE_MULTIPROCESSING and len(fittable_pieces) > 3
+
+    if will_use_multiprocessing:
+        # Use fewer attempts with parallelism (8 workers × 16 attempts = 128 total evaluations)
+        base_attempts = max(1, PARALLEL_PACKING_ATTEMPTS // (2 if FAST_MODE else 1))
+    else:
+        # Use more attempts when sequential
+        base_attempts = max(1, PACKING_ATTEMPTS // (3 if FAST_MODE else 1))
+
     # Fewer attempts for faster packing
     if len(fittable_pieces) <= 3:
         attempts = min(base_attempts, 4)
@@ -5222,7 +5279,7 @@ def compute_best_packing_for_object(obj: dict, pieces: list[tuple]) -> list:
     elif len(fittable_pieces) <= 12:
         attempts = min(base_attempts, 12)
     else:
-        attempts = min(base_attempts, 18)  # Reduced for large problems
+        attempts = min(base_attempts, 16)  # Reduced for large problems
     
     # Define enhanced sorting strategies based on piece analysis with greedy optimizations
     def get_sorting_strategy(attempt_num, analysis):
@@ -5348,36 +5405,41 @@ def compute_best_packing_for_object(obj: dict, pieces: list[tuple]) -> list:
                 len(fittable_pieces)
             ))
 
-        # Execute packing attempts in parallel
+        # Execute packing attempts in parallel with early stopping
         try:
             with Pool(processes=num_workers) as pool:
-                results = pool.map(_packing_worker_attempt, worker_args)
+                # Use imap_unordered for results as they complete (faster)
+                results_iter = pool.imap_unordered(_packing_worker_attempt, worker_args, chunksize=1)
 
-            # Find best result from all attempts
-            for attempt, result in enumerate(results):
-                if result is None:
-                    continue
+                # Process results as they arrive
+                completed_attempts = 0
+                for result in results_iter:
+                    completed_attempts += 1
 
-                count, placed_area, compactness, used_list = result
+                    if result is None:
+                        continue
 
-                # Enhanced selection criteria: prioritize count, then area, then compactness
-                is_better = (count > best_count or
-                            (count == best_count and placed_area > best_area) or
-                            (count == best_count and placed_area == best_area and compactness < best_compactness))
+                    count, placed_area, compactness, used_list = result
 
-                if is_better:
-                    best_count = count
-                    best_area = placed_area
-                    best_compactness = compactness
-                    best_used = used_list
+                    # Enhanced selection criteria: prioritize count, then area, then compactness
+                    is_better = (count > best_count or
+                                (count == best_count and placed_area > best_area) or
+                                (count == best_count and placed_area == best_area and compactness < best_compactness))
 
-                    # Check for perfect packing
-                    if count == len(fittable_pieces):
-                        print(f"[INFO] All pieces placed by worker {attempt+1}")
-                        break
+                    if is_better:
+                        best_count = count
+                        best_area = placed_area
+                        best_compactness = compactness
+                        best_used = used_list
+
+                        # Check for perfect packing - early termination
+                        if count == len(fittable_pieces):
+                            print(f"[INFO] Perfect packing found after {completed_attempts} attempts - stopping early")
+                            pool.terminate()  # Stop all remaining workers
+                            break
 
             if best_count > 0:
-                print(f"[INFO] Best result: {best_count}/{len(fittable_pieces)} pieces placed")
+                print(f"[INFO] Parallel best: {best_count}/{len(fittable_pieces)} pieces ({completed_attempts} attempts)")
 
         except Exception as e:
             print(f"[WARN] Parallel packing failed ({e}), falling back to sequential")
